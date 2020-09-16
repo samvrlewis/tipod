@@ -1,28 +1,24 @@
 package main
 
 import (
-	"context"
 	"flag"
-	"fmt"
 	"log"
-	"net"
-	"sync"
+	"os"
+	"os/signal"
 	"time"
 
-	"github.com/samvrlewis/tipod/encoding"
+	"github.com/samvrlewis/tipod"
 	"github.com/samvrlewis/tipod/tun"
-	"golang.org/x/net/ipv4"
 )
-
-const (
-	MTU_SIZE = 150
-)
-
-var lock sync.Mutex
 
 func main() {
-	tunName := flag.String("tun-name", "tun", "tun name")
-	tunIp := flag.String("tun-ip", "192.168.50.2/24", "tun ip")
+	tunName := flag.String("tun-name", "tun", "The name to assign to the tunnel")
+	tunIP := flag.String("tun-ip", "192.168.50.2/24", "The IP address to assign to the tunnel")
+	domainName := flag.String("domain-name", "samlewis.me", "Domain name to use for queries")
+	dnsIP := flag.String("dns-ip", "10.1.1.1", "The DNS server to connect to")
+	dnsPort := flag.Int("dns-port", 54, "Port of the DNS server to connect to")
+	pollTimeMillis := flag.Int("poll-time", 50, "How frequently (in ms) to poll the DNS server")
+
 	flag.Parse()
 	tun, err := tun.NewTun(*tunName)
 
@@ -34,94 +30,23 @@ func main() {
 		log.Fatalln("Error setting TUN link up: ", err)
 	}
 
-	if err := tun.SetNetwork(*tunIp); err != nil {
+	if err := tun.SetNetwork(*tunIP); err != nil {
 		log.Fatalln("Error setting network: ", err)
 	}
 
-	if err := tun.SetMtu(MTU_SIZE); err != nil {
+	if err := tun.SetMtu(tipod.MTU_SIZE); err != nil {
 		log.Fatalln("Error setting network: ", err)
 	}
 
-	var resolver *net.Resolver
-	nameserver := "10.1.1.1"
+	client := tipod.NewClient(*domainName, time.Millisecond*time.Duration(*pollTimeMillis), *dnsIP, *dnsPort, tun)
 
-	// don't think I need to do this - just use the system dns
-	if nameserver != "" {
-		resolver = &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{}
-				return d.DialContext(ctx, "udp", net.JoinHostPort(nameserver, "54"))
-			},
-		}
-	} else {
-		resolver = net.DefaultResolver
-	}
+	go client.Start()
 
-	toDns := make(chan []byte)
-
-	go func() {
-		for {
-			domainPrefix := "notreal."
-
-			select {
-			case data := <-toDns:
-				log.Println("Got data: ", data)
-				domainPrefix, err = encoding.ToDomainPrefix(data)
-				if err != nil {
-					log.Fatalln(err)
-				}
-			case <-time.After(20 * time.Millisecond):
-				fmt.Println("timeout 1")
-			}
-
-			domainPrefix = domainPrefix + "samlewis.me"
-			log.Println("Sending request: ", domainPrefix)
-
-			dataBack, err := resolver.LookupTXT(context.Background(), domainPrefix)
-
-			if err != nil {
-				log.Println(err)
-				continue
-			}
-
-			if dataBack[0] == "" {
-				log.Println("Empty!")
-				continue
-			}
-
-			bytesBack, err := encoding.FromTxtData(dataBack[0])
-
-			if err != nil {
-				log.Fatalln(err)
-			}
-
-			log.Println("Writing to tun: ", bytesBack)
-			tun.Write(bytesBack)
-		}
-	}()
-
-	go func() {
-		packet := make([]byte, MTU_SIZE)
-
-		for {
-			n, err := tun.Read(packet)
-			if err != nil {
-				log.Println(err)
-			}
-			log.Printf("Received from TUN: % x\n", packet[:n])
-
-			header, _ := ipv4.ParseHeader(packet[:n])
-
-			log.Printf("isTCP: %v, header: %s", header.Protocol == 6, header)
-			log.Println("From IP: ", header.Src.String())
-			log.Println("To IP: ", header.Dst.String())
-
-			toDns <- packet[:n]
-		}
-	}()
-
-	for {
-
+	c := make(chan os.Signal)
+	signal.Notify(c, os.Interrupt)
+	select {
+	case <-c:
+		log.Println("Shutting down")
+		client.Stop()
 	}
 }
